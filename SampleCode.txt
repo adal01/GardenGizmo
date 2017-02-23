@@ -1,0 +1,522 @@
+/*
+ * Copyright (c) 2015, Majenko Technologies
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without modification,
+ * are permitted provided that the following conditions are met:
+ *
+ * * Redistributions of source code must retain the above copyright notice, this
+ *   list of conditions and the following disclaimer.
+ *
+ * * Redistributions in binary form must reproduce the above copyright notice, this
+ *   list of conditions and the following disclaimer in the documentation and/or
+ *   other materials provided with the distribution.
+ *
+ * * Neither the name of Majenko Technologies nor the names of its
+ *   contributors may be used to endorse or promote products derived from
+ *   this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * 
+ * Modified by Steve Altemeier - October 2016
+ * If get a webpage request from a client, send a message via serial to the arduino
+ * to get any needed data.  Then serve a response to the client.  If no response from
+ * the arduino after [x] seconds, serve a webpage with an eroor message.
+ * 
+ * Modified by Steve Altemeier - November 2016
+ * Added ability to get time from an NTP server, keep track of the current time,
+ * and periodically send the current time over a serial connection.
+ */
+
+#include <ESP8266WiFi.h>
+#include <WiFiClient.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+#include <TimeLib.h>
+#include <WiFiUdp.h>
+
+const char *ssid = "Linksys00216";  //Makerspace
+const char *password = "jjbeyprxax";  //Makerspace
+IPAddress gateway(192, 168, 1, 1);  //Makerspace
+//const char *ssid = "ATT2jrG7ZG";   //Home
+//const char *password = "3d3n58rdy2#8";  //Home
+//IPAddress gateway(192, 168, 1, 254);  //Home
+IPAddress ip(192,168,1,134);
+IPAddress subnet(255, 255, 255, 0);
+const int CENTURY = 2000;
+//ESP8266WebServer server ( ip , 80 );  //This doesn't seem to work for some reason
+ESP8266WebServer server ( 80 );
+
+//***********************NTP Time Server Declarations***************************
+// NTP Servers:
+static const char ntpServerName[] = "us.pool.ntp.org";
+
+int timeZone = -5;  // Eastern Standard Time (USA)
+
+WiFiUDP Udp;
+unsigned int localPort = 8888;  // local port to listen for UDP packets
+
+time_t getNtpTime();
+void digitalClockDisplay();
+void printDigits(int digits);
+void sendNTPpacket(IPAddress &address);
+
+int set_DST();
+void update_DST();
+void send_current_time();
+
+int DST;
+time_t currTime; // sets the current time in a time_t variable
+int prevHour = -1;
+//********************************************************************
+
+
+void handleRoot() {
+
+  char temp[2000];
+  String serialMsg = "";
+  String dateBuffer = "none";
+  String timeBuffer = "none";
+  String amPm = "none";
+
+//  Serial.print("URI: ");
+//  Serial.println(server.uri());
+
+//Get any arguments from the call
+  if (server.args() > 0) {
+    serialMsg = String(server.args()) + ";";
+    for (int x=0; x < server.args(); x++) {
+//      if (strcmp(server.argName(x), "H")) dateBuffer = server.arg(x);
+//      else if (strcmp(server.argName(x), "J")) timeBuffer = server.arg(x);
+      if (server.argName(x).equals("H")) dateBuffer = server.arg(x);
+      else if (server.argName(x).equals("J")) timeBuffer = server.arg(x);
+      else if (server.argName(x).equals("A")) amPm = server.arg(x);
+      else {
+        serialMsg += server.argName(x) + ":";
+        serialMsg += server.arg(x) + ";";
+      }
+    }
+    if (!dateBuffer.equals("none") && !timeBuffer.equals("none") && !amPm.equals("none")) {
+      serialMsg += "Z:";
+      serialMsg += (String)unix_time(dateBuffer, timeBuffer, amPm) + ";";
+    }
+  }
+
+//Send any arguments and request the current status for display on the webpage
+  serialMsg += "S;\n";
+  Serial.print(serialMsg);
+
+  bool On;
+  unsigned int minsRem;
+  byte timerInc;
+  byte eventTimerStatus;
+  unsigned long eventTimerStart;
+  bool ok = get_status_response(&On, &minsRem, &timerInc, &eventTimerStatus, &eventTimerStart);
+  int hrsRem = minsRem / 60;
+
+  if (ok) {
+  
+  snprintf ( temp, 2000,
+"<html>\
+  <head>\
+    <title>Coffee Controller</title>\
+    <style>\
+      body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
+      div.absolute {\
+        position: absolute;\
+        top: 100px;\
+        left: 400;\
+      }\
+    </style>\
+  </head>\
+  <body>\
+    <h1>Coffee Machine Control</h1>\
+    <p>%02d/%02d/%02d %d:%02d %s<br /><br />\
+   Status: %s <br /><br />\
+   Timer: %02d:%02d<br />\
+    </p>\
+    <form action='/' method='POST'><p><input type='hidden' name='N' value='x'>\
+        <input type='submit' value='Turn On' style='width:120px;height:40px;'/></form>\
+    <form action='/' method='POST'><p><input type='hidden' name='F' value='x'>\
+        <input type='submit' value='Turn Off' style='width:120px;height:40px;'/></form>\
+    <form action='/' method='POST'> <input type='hidden' name='X' value='x'>\
+        <input type='submit' value='Increase Timer' style='width:120px;height:40px;'/></form>\
+    <form action='/' method='POST'> <input type='hidden' name='M' value='x'>\
+        <input type='submit' value='Decrease Timer' style='width:120px;height:40px;'/></form><br />\
+    <p>Increment/Decrement Time: 0:%02d minutes <br /> <br />\
+    <A href='/set_params'>Update Parameters</A>\
+    </p>\  
+    <div class='absolute'>\
+        Event Timer\
+        <p><form action='/'>\
+        <input type='radio' name='G' value='1' %s> On &nbsp; &nbsp; &nbsp; &nbsp;\
+        <input type='radio' name='G' value='0' %s> Off<br></br>\
+        Date to turn on (m/d/yy) <br /><br />\
+        <input type='text' name='H' value='%d/%d/%d'><br /><br />\
+        Time to turn on (h:mm) <br /><br />\
+        <input type='text' name='J' value='%d:%02d'><br /><br />\
+        <input type='radio' name='A' value='AM' %s> AM &nbsp; &nbsp; &nbsp; &nbsp;\
+        <input type='radio' name='A' value='PM' %s> PM <br></br>\
+        <input type='submit' value='Set Event Timer' style='width:120px;height:40px;'/> <br /><br />\
+        </form></p>\
+    </div>\
+  </body>\
+</html>",
+    month(), day(), year()-CENTURY, hourFormat12(), minute(), isAM()?"AM":"PM", On?"On":"Off",hrsRem, minsRem % 60, timerInc,\
+    eventTimerStatus?"checked":"", eventTimerStatus?"":"checked",\
+    month(eventTimerStart), day(eventTimerStart), year(eventTimerStart)-CENTURY, hourFormat12(eventTimerStart), minute(eventTimerStart),\
+    isAM(eventTimerStart)?"checked":"", isAM(eventTimerStart)?"":"checked"
+  );
+
+  }else snprintf ( temp, 400, 
+
+"<html>\
+  <head>\
+    <title>Coffee Controller</title>\
+    <style>\
+      body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
+    </style>\
+  </head>\
+  <body>\
+    <h1>Error: No status received from controller.</h1></body></html>");
+  
+  server.send ( 200, "text/html", temp );
+}
+
+
+void update_parameters() {
+
+//  Serial.print("URI: ");
+//  Serial.println(server.uri());
+
+//Send a request for the parameters
+  Serial.print("T;\n");
+
+  byte initTime;
+  byte timerInc;
+  byte maxTime;
+  bool ok = get_parameters(&initTime, &timerInc, &maxTime);
+  
+  char temp[2000];
+
+  snprintf ( temp, 2000,
+"<html>\
+  <head>\
+    <title>Coffee Controller</title>\
+    <style>\
+      body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
+    </style>\
+  </head>\
+  <body>\
+    <form action='/' method='POST'>\
+    <h1>Coffee Machine Parameter Update</h1>\
+    <input type='text' name='I' value='%d'> Initial Time (minutes) <br /><br />\
+    <input type='text' name='A' value='%d'> Timer Increment (minutes) <br /><br />\
+    <input type='text' name='D' value='%d'> Max On Time (minutes) <br /><br />\
+    <input type='submit' value='Submit Changes' style='width:120px;height:40px;'/> <br /><br />\
+    </form> <br /><br />\
+    <A href='/'>Cancel</A>\
+  </body>\
+</html>",
+  initTime, timerInc, maxTime
+  );
+  server.send ( 200, "text/html", temp );
+}
+
+
+void handleNotFound() {
+
+	String message = "File Not Found\n\n";
+	message += "URI: ";
+	message += server.uri();
+	message += "\nMethod: ";
+	message += ( server.method() == HTTP_GET ) ? "GET" : "POST";
+	message += "\nArguments: ";
+	message += server.args();
+	message += "\n";
+
+	for ( uint8_t i = 0; i < server.args(); i++ ) {
+		message += " " + server.argName ( i ) + ": " + server.arg ( i ) + "\n";
+	}
+
+	server.send ( 404, "text/plain", message );
+}
+
+
+void setup ( void ) {
+
+	Serial.begin ( 9600 );
+	WiFi.begin ( ssid, password );
+//	Serial.println ( "" );
+  WiFi.config(ip, gateway, subnet);
+
+	// Wait for connection
+	while ( WiFi.status() != WL_CONNECTED ) {
+		delay ( 500 );
+//		Serial.print ( "." );
+	}
+
+//	Serial.println ( "" );
+//	Serial.print ( "Connected to " );
+//	Serial.println ( ssid );
+//	Serial.print ( "IP address: " );
+//  Serial.print("I");
+//	Serial.println ( WiFi.localIP() );
+
+//Set up the HTTP Server
+	if ( MDNS.begin ( "esp8266" ) ) {
+//		Serial.println ( "MDNS responder started" );
+	}
+
+	server.on ( "/", handleRoot );
+  server.on ( "/set_params", update_parameters );
+//	server.on ( "/test.svg", drawGraph );
+//	server.on ( "/inline", []() {
+//		server.send ( 200, "text/plain", "this works as well" );
+//	} );
+	server.onNotFound ( handleNotFound );
+	server.begin();
+//	Serial.println ( "HTTP server started" );
+
+//Set up the NTP time service using UDP
+  Udp.begin(localPort);
+//  Serial.print("Local port: ");
+//  Serial.println(Udp.localPort());
+//  Serial.println("waiting for sync");
+  setSyncProvider(getNtpTime);
+  setSyncInterval(3600);
+  DST = set_DST();
+}
+
+
+void loop ( void ) {
+
+//  The line below was included to eliminate noise; sometimes ESP and 328p would be out of sync.  Now handled in check_serial function.
+//  clear_serial_buffer();  //As currently written, should be no unexpected Serial data coming in, so data in the buffer here is problematic.
+
+  check_serial();
+
+	server.handleClient();
+
+  if (timeStatus() != timeNotSet) {
+    if (hour() != prevHour) {  //Send an update each time the hour changes
+      prevHour = hour();
+//    if (minute() != prevHour) {  //Send an update each time the hour changes
+//      prevHour = minute();
+      update_DST();
+//      send_current_time();
+    }
+  }
+}
+
+
+bool get_status_response(bool* On, unsigned int* minsRem, byte* timerInc, byte* eventTimerStatus, unsigned long* eventTimerStart){
+
+  //Wait for up to 3 seconds for a response
+  unsigned long start = millis();
+  while (millis()-start<3000) {
+    if (Serial.available()) {
+      delay(10);  //Give a little time for all data to arrive in buffer
+      *On = (bool)Serial.parseInt();
+      *minsRem = Serial.parseInt();
+      *timerInc = (byte)Serial.parseInt();
+      *eventTimerStatus = (byte)Serial.parseInt();
+      *eventTimerStart = Serial.parseInt();
+      if (Serial.find('\n')) return 1;
+      else return 0;
+    }
+  }
+  return 0;  //Never got the entire message
+}
+
+
+bool get_parameters(byte* initTimer, byte* timerInc, byte* maxTimer){
+
+  //Wait for up to 3 seconds for a response
+  unsigned long start = millis();
+  while (millis()-start<3000) {
+    if (Serial.available()) {
+      delay(10);  //Give a little time for all data to arrive in buffer
+      *initTimer = (byte)Serial.parseInt();
+      *timerInc = (byte)Serial.parseInt();
+      *maxTimer = (byte)Serial.parseInt();
+      if (Serial.find('\n')) return 1;
+      else return 0;
+    }
+  }
+  return 0;  //Never got the entire message
+}
+
+
+/*void clear_serial_buffer() {
+
+  while (Serial.available()) {
+    char c = Serial.read();
+  }
+}*/
+
+
+void check_serial() {
+
+  //Check the serial connection for a time request; should be of the form TR;\n
+  while (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    if (input == "TR;") {  //Have received a request for the current time
+      send_current_time();
+    }
+  }
+}
+
+/*-------- NTP code ----------*/
+
+const int NTP_PACKET_SIZE = 48; // NTP time is in the first 48 bytes of message
+byte packetBuffer[NTP_PACKET_SIZE]; //buffer to hold incoming & outgoing packets
+
+time_t getNtpTime()
+{
+  IPAddress ntpServerIP; // NTP server's ip address
+
+  while (Udp.parsePacket() > 0) ; // discard any previously received packets
+//  Serial.println("Transmit NTP Request");
+  // get a random server from the pool
+  WiFi.hostByName(ntpServerName, ntpServerIP);
+//  Serial.print(ntpServerName);
+//  Serial.print(": ");
+//  Serial.println(ntpServerIP);
+  sendNTPpacket(ntpServerIP);
+  uint32_t beginWait = millis();
+  while (millis() - beginWait < 1500) {
+    int size = Udp.parsePacket();
+    if (size >= NTP_PACKET_SIZE) {
+//      Serial.println("Receive NTP Response");
+      Udp.read(packetBuffer, NTP_PACKET_SIZE);  // read packet into the buffer
+      unsigned long secsSince1900;
+      // convert four bytes starting at location 40 to a long integer
+      secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
+      secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
+      secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
+      secsSince1900 |= (unsigned long)packetBuffer[43];
+      return secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR;
+    }
+  }
+//  Serial.println("No NTP Response :-(");
+  return 0; // return 0 if unable to get the time
+}
+
+// send an NTP request to the time server at the given address
+void sendNTPpacket(IPAddress &address)
+{
+  // set all bytes in the buffer to 0
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  // Initialize values needed to form NTP request
+  // (see URL above for details on the packets)
+  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+  packetBuffer[1] = 0;     // Stratum, or type of clock
+  packetBuffer[2] = 6;     // Polling Interval
+  packetBuffer[3] = 0xEC;  // Peer Clock Precision
+  // 8 bytes of zero for Root Delay & Root Dispersion
+  packetBuffer[12] = 49;
+  packetBuffer[13] = 0x4E;
+  packetBuffer[14] = 49;
+  packetBuffer[15] = 52;
+  // all NTP fields have been given values, now
+  // you can send a packet requesting a timestamp:
+  Udp.beginPacket(address, 123); //NTP requests are to port 123
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
+  Udp.endPacket();
+}
+
+
+/*-------- My additional clock functions ----------*/
+int set_DST() {
+
+  //returns true if on daylight savings time, else false
+  if ((month() > 3) && (month() < 11)) { //In a month that has daylight savings time the entire month
+    return 1;
+  }
+  if (month() == 3) {
+    if (day() > weekday() + 7) { //After the second Sunday in March
+      return 1;
+    }
+    else if ((weekday() == 1) && (day() > 7) && (hour() > 1)) { //After 2:00 am on second Sunday in March
+      return 1;
+    }
+    else return 0;  //Not yet 2:00 am on the second Sunday in March
+  }
+  if (month() == 11) {
+    if (day() > weekday()) { //After the first Sunday in November
+      return 0;
+    }
+    else if ((weekday()==1) && (hour() > 1)) { //After 2:00 am on first Sunday in November
+      return 0;
+    }
+    else return 1;  //Not yet 2:00 am on the first Sunday in November
+  }
+  return 0;
+}
+
+void update_DST() {
+
+  //This function updates the DST variable as needed
+  //See if need to end DST in November
+  if ((month()==11) && (weekday()==1) && (day()<8) && (hour()>2) && (DST==1)) DST = 0;
+  //See if need to start DST in March
+  if ((month()==3) && (weekday()==1) && (day()>7) && (day()<15) && (hour()>2) && (DST==0)) DST = 1;
+}
+
+void send_current_time() {
+
+  currTime = now() + DST*SECS_PER_HOUR;
+  Serial.print("U;");
+  Serial.print(currTime);
+  Serial.print('\n');
+/*  Serial.print(currTime); Serial.print(",");
+  Serial.print(year(currTime)); Serial.print(",");
+  Serial.print(month(currTime)); Serial.print(",");
+  Serial.print(day(currTime)); Serial.print(",");
+  Serial.print(hour(currTime)); Serial.print(",");
+  Serial.print(minute(currTime)); Serial.print(",");
+  Serial.print(second(currTime)); Serial.print(",");
+  Serial.println(weekday(currTime));*/
+}
+
+unsigned long unix_time(String dateBuffer, String timeBuffer, String amPm) {
+
+  tmElements_t targetTimeStruc;  //This is a time structure for converting the target time of an Event Timer to Unix time
+  time_t targetTime;
+
+//  Serial.println(dateBuffer);
+//  Serial.println(timeBuffer);
+  targetTimeStruc.Month = (byte)dateBuffer.toInt();
+  byte index = dateBuffer.indexOf('/');
+  targetTimeStruc.Day = (byte)dateBuffer.substring(index+1).toInt();
+  index = dateBuffer.indexOf('/',index+1);
+  targetTimeStruc.Year = (byte)dateBuffer.substring(index+1).toInt() + 30;  //Years are stored as an offset from 1970.  Add 30 since received value is offset from 2000.
+  targetTimeStruc.Hour = (byte)timeBuffer.toInt();
+  if ((amPm.equals("PM")) && targetTimeStruc.Hour != 12) targetTimeStruc.Hour += 12;
+  if ((amPm.equals("AM")) && targetTimeStruc.Hour == 12) targetTimeStruc.Hour == 0;
+  index = timeBuffer.indexOf(':');
+  targetTimeStruc.Minute = (byte)timeBuffer.substring(index+1).toInt();
+  targetTimeStruc.Second = 0;
+//  Serial.println(targetTimeStruc.Year);
+//  Serial.println(targetTimeStruc.Month);
+//  Serial.println(targetTimeStruc.Day);
+//  Serial.println(targetTimeStruc.Hour);
+//  Serial.println(targetTimeStruc.Minute);
+//  Serial.println(makeTime(targetTimeStruc));
+//  Serial.println(makeTime(targetTimeStruc));
+//  Serial.println(timeZone);
+//  Serial.println(DST);
+//  Serial.println((timeZone + DST)*SECS_PER_HOUR);
+  targetTime = makeTime(targetTimeStruc); 
+  return targetTime;
+}
